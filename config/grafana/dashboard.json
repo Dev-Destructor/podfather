@@ -1,0 +1,91 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Pods Monitored",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "podfather_pods_monitored", "legendFormat": "Pods" }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Total Adjustments",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "sum(podfather_resource_adjustments_total)", "legendFormat": "Total" }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 }
+    },
+    {
+      "title": "Collection Errors",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "podfather_metrics_collection_errors_total", "legendFormat": "Errors" }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "title": "Starvation Events",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "sum(podfather_pod_starvation_events_total)", "legendFormat": "Events" }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "title": "Adjustments Rate per Minute",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "sum(rate(podfather_resource_adjustments_total[1m])) by (resource) * 60", "legendFormat": "{{ resource }}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 }
+    },
+    {
+      "title": "Evaluation Duration (p50/p95/p99)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(podfather_evaluation_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(podfather_evaluation_duration_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(podfather_evaluation_duration_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 }
+    },
+    {
+      "title": "Recommendation Variance Distribution",
+      "type": "histogram",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "podfather_recommendation_variance_percent_bucket", "legendFormat": "{{ resource }}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 }
+    },
+    {
+      "title": "Adjustments by Namespace/Pod",
+      "type": "table",
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "sum by (namespace, pod, container, resource) (podfather_resource_adjustments_total)", "legendFormat": "", "format": "table", "instant": true }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["podfather", "kubernetes", "autoscaling"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "Podfather - Pod Resource Optimization",
+  "uid": "podfather-dashboard"
+}

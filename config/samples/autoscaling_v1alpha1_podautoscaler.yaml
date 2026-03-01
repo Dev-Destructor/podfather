@@ -1,0 +1,40 @@
+apiVersion: autoscaling.podfather.io/v1alpha1
+kind: PodAutoscaler
+metadata:
+  labels:
+    app.kubernetes.io/name: podfather
+    app.kubernetes.io/managed-by: kustomize
+  name: podautoscaler-sample
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  targetRef:
+    kind: Deployment
+    name: my-app
+    apiVersion: apps/v1
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        minAllowed:
+          cpu: "50m"
+          memory: "64Mi"
+        maxAllowed:
+          cpu: "4"
+          memory: "8Gi"
+        controlledResources:
+          - cpu
+          - memory
+  updatePolicy:
+    updateMode: Auto
+    maxUnavailable: 1
+  metricsCollectionIntervalSeconds: 30
+  evaluationWindowMinutes: 5
+  varianceThresholdPercent: 15
+  dryRun: false
+  # VPA integration: when enabled, Podfather uses VPA recommendations
+  # instead of its own algorithm (requires VPA to be in "Off" mode).
+  # vpaPolicy:
+  #   enabled: true
+  #   strictMode: false
+  #   # vpaName: ""  # optional: specify exact VPA name, otherwise auto-discovered via targetRef
