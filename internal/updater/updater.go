@@ -30,6 +30,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"math"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -50,6 +51,20 @@ const (
 	ModeInPlace  UpdateMode = "InPlace"
 	ModeRecreate UpdateMode = "Recreate"
 	ModeOff      UpdateMode = "Off"
+)
+
+// Workload kind constants.
+const (
+	kindDeployment  = "Deployment"
+	kindStatefulSet = "StatefulSet"
+	kindDaemonSet   = "DaemonSet"
+)
+
+// Strategy result constants.
+const (
+	// StrategyAlreadyApplied indicates the workload template already has the
+	// recommended resource values — no mutation was needed.
+	StrategyAlreadyApplied = "already-applied"
 )
 
 // PodUpdater applies resource recommendations to pods.
@@ -97,14 +112,18 @@ func (u *PodUpdater) ApplyRecommendation(
 		if err != nil {
 			return "", fmt.Errorf("workload template patch failed: %w", err)
 		}
-		if !patched {
-			// Template already matches — no need to evict.
-			return "already-applied", nil
-		}
+		// In Recreate mode we always evict, even when the template already
+		// matches the recommendation. The running pod may still have stale
+		// resources and the caller explicitly asked for immediate replacement.
 		if err := u.evictPod(ctx, pod); err != nil {
-			// Template is already patched; the rolling update will eventually
-			// replace the pod even if eviction fails, so log but don't fail hard.
-			return "workload-patch", fmt.Errorf("template patched but eviction failed: %w", err)
+			if patched {
+				// Template was patched — the rolling update will eventually
+				// replace the pod even if eviction fails. Surface as partial
+				// success so the caller does not treat it as fully failed.
+				return "workload-patch-eviction-failed", nil
+			}
+			// Template was already up-to-date and eviction failed.
+			return StrategyAlreadyApplied, fmt.Errorf("eviction failed: %w", err)
 		}
 		return "recreate", nil
 
@@ -120,7 +139,7 @@ func (u *PodUpdater) ApplyRecommendation(
 				return "", fmt.Errorf("in-place resize failed and workload patch failed: %w", err)
 			}
 			if !patched {
-				return "already-applied", nil
+				return StrategyAlreadyApplied, nil
 			}
 			return "workload-patch", nil
 		}
@@ -147,13 +166,13 @@ func (u *PodUpdater) applyInPlace(ctx context.Context, pod *corev1.Pod, rec calc
 				pod.Spec.Containers[i].Resources.Limits = corev1.ResourceList{}
 			}
 			pod.Spec.Containers[i].Resources.Requests[corev1.ResourceCPU] = *resource.NewMilliQuantity(
-				int64(rec.CPUCoresRequest*1000), resource.DecimalSI)
+				int64(math.Round(rec.CPUCoresRequest*1000)), resource.DecimalSI)
 			pod.Spec.Containers[i].Resources.Requests[corev1.ResourceMemory] = *resource.NewQuantity(
-				int64(rec.MemoryBytesRequest), resource.BinarySI)
+				int64(math.Round(rec.MemoryBytesRequest)), resource.BinarySI)
 			pod.Spec.Containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(
-				int64(rec.CPUCoresLimit*1000), resource.DecimalSI)
+				int64(math.Round(rec.CPUCoresLimit*1000)), resource.DecimalSI)
 			pod.Spec.Containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(
-				int64(rec.MemoryBytesLimit), resource.BinarySI)
+				int64(math.Round(rec.MemoryBytesLimit)), resource.BinarySI)
 			updated = true
 			break
 		}
@@ -182,11 +201,11 @@ func (u *PodUpdater) applyViaWorkloadPatch(ctx context.Context, pod *corev1.Pod,
 	}
 
 	switch kind {
-	case "Deployment":
+	case kindDeployment:
 		return u.patchDeploymentTemplate(ctx, pod.Namespace, name, rec)
-	case "StatefulSet":
+	case kindStatefulSet:
 		return u.patchStatefulSetTemplate(ctx, pod.Namespace, name, rec)
-	case "DaemonSet":
+	case kindDaemonSet:
 		return u.patchDaemonSetTemplate(ctx, pod.Namespace, name, rec)
 	default:
 		return false, fmt.Errorf("unsupported workload kind %q for pod %s/%s",
@@ -215,17 +234,17 @@ func (u *PodUpdater) resolveOwningWorkload(ctx context.Context, pod *corev1.Pod)
 				return "", "", fmt.Errorf("failed to get ReplicaSet %s: %w", ref.Name, err)
 			}
 			for _, rsRef := range rs.OwnerReferences {
-				if rsRef.Controller != nil && *rsRef.Controller && rsRef.Kind == "Deployment" {
-					return "Deployment", rsRef.Name, nil
+				if rsRef.Controller != nil && *rsRef.Controller && rsRef.Kind == kindDeployment {
+					return kindDeployment, rsRef.Name, nil
 				}
 			}
 			return "", "", fmt.Errorf("ReplicaSet %s has no Deployment owner", ref.Name)
 
-		case "StatefulSet":
-			return "StatefulSet", ref.Name, nil
+		case kindStatefulSet:
+			return kindStatefulSet, ref.Name, nil
 
-		case "DaemonSet":
-			return "DaemonSet", ref.Name, nil
+		case kindDaemonSet:
+			return kindDaemonSet, ref.Name, nil
 		}
 	}
 	return "", "", fmt.Errorf("no supported owning workload found for pod %s/%s",
@@ -300,10 +319,10 @@ func (u *PodUpdater) patchDaemonSetTemplate(ctx context.Context, namespace, name
 // already has resources matching the recommendation. This prevents redundant
 // patches that would trigger unnecessary rolling updates and reconcile storms.
 func containerResourcesMatch(containers []corev1.Container, rec calculator.ResourceRecommendation) bool {
-	wantCPUReq := resource.NewMilliQuantity(int64(rec.CPUCoresRequest*1000), resource.DecimalSI)
-	wantMemReq := resource.NewQuantity(int64(rec.MemoryBytesRequest), resource.BinarySI)
-	wantCPULim := resource.NewMilliQuantity(int64(rec.CPUCoresLimit*1000), resource.DecimalSI)
-	wantMemLim := resource.NewQuantity(int64(rec.MemoryBytesLimit), resource.BinarySI)
+	wantCPUReq := resource.NewMilliQuantity(int64(math.Round(rec.CPUCoresRequest*1000)), resource.DecimalSI)
+	wantMemReq := resource.NewQuantity(int64(math.Round(rec.MemoryBytesRequest)), resource.BinarySI)
+	wantCPULim := resource.NewMilliQuantity(int64(math.Round(rec.CPUCoresLimit*1000)), resource.DecimalSI)
+	wantMemLim := resource.NewQuantity(int64(math.Round(rec.MemoryBytesLimit)), resource.BinarySI)
 
 	for i := range containers {
 		if containers[i].Name != rec.ContainerName {
@@ -340,13 +359,13 @@ func patchContainerResources(containers []corev1.Container, rec calculator.Resou
 			containers[i].Resources.Limits = corev1.ResourceList{}
 		}
 		containers[i].Resources.Requests[corev1.ResourceCPU] = *resource.NewMilliQuantity(
-			int64(rec.CPUCoresRequest*1000), resource.DecimalSI)
+			int64(math.Round(rec.CPUCoresRequest*1000)), resource.DecimalSI)
 		containers[i].Resources.Requests[corev1.ResourceMemory] = *resource.NewQuantity(
-			int64(rec.MemoryBytesRequest), resource.BinarySI)
+			int64(math.Round(rec.MemoryBytesRequest)), resource.BinarySI)
 		containers[i].Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(
-			int64(rec.CPUCoresLimit*1000), resource.DecimalSI)
+			int64(math.Round(rec.CPUCoresLimit*1000)), resource.DecimalSI)
 		containers[i].Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(
-			int64(rec.MemoryBytesLimit), resource.BinarySI)
+			int64(math.Round(rec.MemoryBytesLimit)), resource.BinarySI)
 		return true
 	}
 	return false
@@ -423,7 +442,7 @@ func (u *PodUpdater) ApplyToStatefulSetPods(
 			return "", fmt.Errorf("failed to patch StatefulSet %s/%s template: %w", namespace, stsName, err)
 		}
 		if !patched {
-			return "already-applied", nil
+			return StrategyAlreadyApplied, nil
 		}
 		return "sts-template-patch", nil
 

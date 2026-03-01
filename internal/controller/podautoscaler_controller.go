@@ -30,6 +30,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -208,18 +209,23 @@ func (r *PodAutoscalerReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	} else {
 		// Podfather path: group pods by owning workload, aggregate metrics, apply once per group.
-		groups, gErr := groupPodsByOwner(ctx, r.Client, runningPods)
-		if gErr != nil {
-			logger.Error(gErr, "Failed to group pods by owner, falling back to individual evaluation")
-			// Fallback: treat each pod as its own group.
-			groups = make(map[WorkloadKey][]corev1.Pod, len(runningPods))
-			for i := range runningPods {
-				key := BarePodsKey(runningPods[i].Namespace, runningPods[i].Name)
-				groups[key] = []corev1.Pod{runningPods[i]}
-			}
-		}
+		groups := groupPodsByOwner(ctx, r.Client, runningPods)
+
+		// Sort keys for deterministic iteration order.
+		// Non-deterministic map iteration would cause status field ordering
+		// to flip between reconciles, triggering unnecessary Status().Update() writes.
+		sortedKeys := make([]WorkloadKey, 0, len(groups))
 
 		for key, groupPods := range groups {
+			sortedKeys = append(sortedKeys, key)
+			_ = groupPods // used below
+		}
+		sort.Slice(sortedKeys, func(i, j int) bool {
+			return sortedKeys[i].String() < sortedKeys[j].String()
+		})
+
+		for _, key := range sortedKeys {
+			groupPods := groups[key]
 			recs, adj, ok, reasons, wgStatus := r.evaluateWorkloadGroup(
 				ctx, pa, key, groupPods, collector, podUpdater,
 				cfg, constraints, nsConstraints, aggStrategy, stsUpdateMode,
@@ -536,10 +542,10 @@ func (r *PodAutoscalerReconciler) applyRecommendation(
 		return 0
 	}
 
-	// "already-applied" means the workload template already has the correct
-	// resources — skip logging/metrics to prevent noise while the rollout
+	// updater.StrategyAlreadyApplied means the workload template already has the
+	// correct resources — skip logging/metrics to prevent noise while the rollout
 	// replaces old pods.
-	if strategy == "already-applied" {
+	if strategy == updater.StrategyAlreadyApplied {
 		logger.V(1).Info("Workload template already up-to-date, waiting for rollout",
 			"container", rec.ContainerName, "source", source)
 		return 0
@@ -591,7 +597,7 @@ func (r *PodAutoscalerReconciler) evaluateWorkloadGroup(
 	)
 
 	// Bare pods: fall back to individual per-pod evaluation (existing behaviour).
-	if key.Kind == "BarePod" {
+	if key.Kind == WorkloadKindBarePod {
 		pod := &pods[0]
 		recs, adj, ok, reasons := r.evaluatePodMetrics(ctx, pa, pod, collector,
 			podUpdater, cfg, constraints, nsConstraints)
@@ -608,8 +614,8 @@ func (r *PodAutoscalerReconciler) evaluateWorkloadGroup(
 			"Skipping update for %s %s — previous rollout still in progress",
 			key.Kind, key.Name)
 		// Still collect metrics for status, but do not apply.
-		recs, _, ok, reasons := r.collectGroupMetricsForStatus(
-			ctx, pa, pods, collector, cfg, constraints, nsConstraints, aggStrategy)
+		recs, ok, reasons := r.collectGroupMetricsForStatus(
+			ctx, pods, collector, cfg, constraints, nsConstraints, aggStrategy)
 		wgStatus := &autoscalingv1alpha1.WorkloadGroupStatus{
 			Kind:                     key.Kind,
 			Name:                     key.Name,
@@ -671,19 +677,26 @@ func (r *PodAutoscalerReconciler) evaluateWorkloadGroup(
 	}
 
 	// Step 2: Discover all unique container names across pods.
-	containerNames := make(map[string]struct{})
+	// Collect into a sorted slice to ensure deterministic iteration order,
+	// which prevents status field ordering from flipping between reconciles.
+	containerNameSet := make(map[string]struct{})
 	for _, e := range entries {
 		for name := range e.containerUsage {
-			containerNames[name] = struct{}{}
+			containerNameSet[name] = struct{}{}
 		}
 	}
+	sortedContainerNames := make([]string, 0, len(containerNameSet))
+	for name := range containerNameSet {
+		sortedContainerNames = append(sortedContainerNames, name)
+	}
+	sort.Strings(sortedContainerNames)
 
 	// Step 3: For each container, aggregate metrics and compute recommendation.
 	var containerRecs []autoscalingv1alpha1.ContainerRecommendation
 	var adjustments int64
 	var clampReasons []string
 
-	for containerName := range containerNames {
+	for _, containerName := range sortedContainerNames {
 		// Gather all usage samples for this container.
 		var usageSamples []calculator.ResourceUsage
 		var allocSamples []calculator.ResourceAllocation
@@ -798,7 +811,7 @@ func (r *PodAutoscalerReconciler) applyGroupRecommendation(
 		"container", rec.ContainerName,
 	)
 
-	if key.Kind == "StatefulSet" {
+	if key.Kind == WorkloadKindStatefulSet {
 		strategy, err := podUpdater.ApplyToStatefulSetPods(ctx, pods, rec, key.Name, stsUpdateMode)
 		if err != nil {
 			logger.Error(err, "Failed to apply recommendation to StatefulSet",
@@ -812,7 +825,7 @@ func (r *PodAutoscalerReconciler) applyGroupRecommendation(
 			}
 			return 0
 		}
-		if strategy == "already-applied" {
+		if strategy == updater.StrategyAlreadyApplied {
 			logger.V(1).Info("StatefulSet template already up-to-date")
 			return 0
 		}
@@ -837,37 +850,133 @@ func (r *PodAutoscalerReconciler) applyGroupRecommendation(
 
 // collectGroupMetricsForStatus collects and aggregates metrics for a group
 // without applying any updates. Used when a rollout is in progress.
+//
+// Unlike the main evaluateWorkloadGroup path, this function never applies
+// updates. It collects per-pod metrics, aggregates them using the configured
+// strategy, and returns a single recommendation per container (matching the
+// CRD contract for WorkloadGroupStatus.ContainerRecommendations).
 func (r *PodAutoscalerReconciler) collectGroupMetricsForStatus(
 	ctx context.Context,
-	pa *autoscalingv1alpha1.PodAutoscaler,
 	pods []corev1.Pod,
 	collector *metrics.Collector,
 	cfg calculator.Config,
 	constraints calculator.Constraints,
 	nsConstraints namespacelimits.NamespaceConstraints,
 	aggStrategy calculator.AggregationStrategy,
-) ([]autoscalingv1alpha1.ContainerRecommendation, int64, bool, []string) {
-	// Re-use the same logic but with dryRun forced — we just need the recs.
-	origDryRun := pa.Spec.DryRun
-	pa.Spec.DryRun = true
-	defer func() { pa.Spec.DryRun = origDryRun }()
+) ([]autoscalingv1alpha1.ContainerRecommendation, bool, []string) {
+	logger := logf.FromContext(ctx)
 
-	// Collect metrics individually and aggregate for status.
-	var containerRecs []autoscalingv1alpha1.ContainerRecommendation
-	var clampReasons []string
-	metricsOk := true
+	// Collect per-pod metrics (same collection logic as evaluateWorkloadGroup).
+	type podMetricsEntry struct {
+		containerUsage map[string]calculator.ResourceUsage
+		containerAlloc map[string]calculator.ResourceAllocation
+	}
 
+	entries := make([]podMetricsEntry, 0, len(pods))
 	for i := range pods {
 		pod := &pods[i]
-		recs, _, ok, reasons := r.evaluatePodMetrics(ctx, pa, pod, collector,
-			nil, cfg, constraints, nsConstraints)
-		containerRecs = append(containerRecs, recs...)
-		if !ok {
-			metricsOk = false
+		podMetricsData, mErr := collector.GetPodMetrics(ctx, pod.Namespace, pod.Name)
+		if mErr != nil {
+			logger.Error(mErr, "Failed to get metrics for pod in group (status-only)", "pod", pod.Name)
+			metrics.CollectionErrors.Inc()
+			continue
 		}
-		clampReasons = append(clampReasons, reasons...)
+
+		currentAllocs := metrics.GetCurrentAllocations(pod)
+		usageMap := make(map[string]calculator.ResourceUsage)
+		allocMap := make(map[string]calculator.ResourceAllocation)
+
+		for _, cm := range podMetricsData.Containers {
+			alloc, ok := currentAllocs[cm.Name]
+			if !ok {
+				continue
+			}
+			usageMap[cm.Name] = calculator.ResourceUsage{
+				ContainerName:   cm.Name,
+				CPUCoresAvg:     cm.Usage.Cpu().AsApproximateFloat64(),
+				CPUCoresPeak:    cm.Usage.Cpu().AsApproximateFloat64(),
+				MemoryBytesAvg:  cm.Usage.Memory().AsApproximateFloat64(),
+				MemoryBytesPeak: cm.Usage.Memory().AsApproximateFloat64(),
+			}
+			allocMap[cm.Name] = calculator.ResourceAllocation{
+				ContainerName:      cm.Name,
+				CPUCoresRequest:    alloc.CPURequest,
+				CPUCoresLimit:      alloc.CPULimit,
+				MemoryBytesRequest: alloc.MemoryRequest,
+				MemoryBytesLimit:   alloc.MemoryLimit,
+			}
+		}
+		entries = append(entries, podMetricsEntry{containerUsage: usageMap, containerAlloc: allocMap})
 	}
-	return containerRecs, 0, metricsOk, clampReasons
+
+	if len(entries) == 0 {
+		return nil, false, nil
+	}
+
+	// Discover unique container names and sort for deterministic ordering.
+	containerNameSet := make(map[string]struct{})
+	for _, e := range entries {
+		for name := range e.containerUsage {
+			containerNameSet[name] = struct{}{}
+		}
+	}
+	sortedNames := make([]string, 0, len(containerNameSet))
+	for name := range containerNameSet {
+		sortedNames = append(sortedNames, name)
+	}
+	sort.Strings(sortedNames)
+
+	// Aggregate per-container across all pods and compute recommendations.
+	var containerRecs []autoscalingv1alpha1.ContainerRecommendation
+	var clampReasons []string
+
+	for _, containerName := range sortedNames {
+		var usageSamples []calculator.ResourceUsage
+		var allocSamples []calculator.ResourceAllocation
+		for _, e := range entries {
+			if u, ok := e.containerUsage[containerName]; ok {
+				usageSamples = append(usageSamples, u)
+			}
+			if a, ok := e.containerAlloc[containerName]; ok {
+				allocSamples = append(allocSamples, a)
+			}
+		}
+		if len(usageSamples) == 0 {
+			continue
+		}
+
+		aggregatedUsage, aggErr := calculator.AggregateUsage(usageSamples, aggStrategy)
+		if aggErr != nil {
+			logger.Error(aggErr, "Failed to aggregate usage (status-only)", "container", containerName)
+			continue
+		}
+		aggregatedAlloc, allocErr := calculator.AggregateAllocations(allocSamples)
+		if allocErr != nil {
+			logger.Error(allocErr, "Failed to aggregate allocations (status-only)", "container", containerName)
+			continue
+		}
+
+		rec, calcErr := calculator.Calculate(aggregatedUsage, aggregatedAlloc, cfg, constraints)
+		if calcErr != nil {
+			logger.Error(calcErr, "Calculation failed (status-only)", "container", containerName)
+			continue
+		}
+
+		if nsConstraints.LimitRangeFound || nsConstraints.ResourceQuotaFound {
+			newCPUReq, newCPULim, newMemReq, newMemLim, reasons := namespacelimits.ClampRecommendation(
+				rec.CPUCoresRequest, rec.CPUCoresLimit,
+				rec.MemoryBytesRequest, rec.MemoryBytesLimit, nsConstraints)
+			rec.CPUCoresRequest = newCPUReq
+			rec.CPUCoresLimit = newCPULim
+			rec.MemoryBytesRequest = newMemReq
+			rec.MemoryBytesLimit = newMemLim
+			clampReasons = append(clampReasons, reasons...)
+		}
+
+		containerRecs = append(containerRecs, toStatusRecommendation(rec))
+	}
+
+	return containerRecs, len(entries) > 0, clampReasons
 }
 
 // ---- Helpers ----

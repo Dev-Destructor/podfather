@@ -27,6 +27,14 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// Workload kind constants used in WorkloadKey.Kind.
+const (
+	WorkloadKindDeployment  = "Deployment"
+	WorkloadKindStatefulSet = "StatefulSet"
+	WorkloadKindDaemonSet   = "DaemonSet"
+	WorkloadKindBarePod     = "BarePod"
+)
+
 // WorkloadKey uniquely identifies a workload that owns a group of pods.
 type WorkloadKey struct {
 	Kind      string
@@ -42,7 +50,7 @@ func (k WorkloadKey) String() string {
 // BarePodsKey returns a synthetic key for pods that have no owning controller.
 // Each bare pod is its own group, keyed by pod name.
 func BarePodsKey(namespace, podName string) WorkloadKey {
-	return WorkloadKey{Kind: "BarePod", Namespace: namespace, Name: podName}
+	return WorkloadKey{Kind: WorkloadKindBarePod, Namespace: namespace, Name: podName}
 }
 
 // groupPodsByOwner groups running pods by their owning workload controller.
@@ -54,13 +62,19 @@ func BarePodsKey(namespace, podName string) WorkloadKey {
 //
 // Pods without a recognized controller owner are each placed in their own
 // group under a synthetic "BarePod" key.
-func groupPodsByOwner(ctx context.Context, c client.Client, pods []corev1.Pod) (map[WorkloadKey][]corev1.Pod, error) {
+//
+// ReplicaSet → Deployment resolution is cached for the duration of the call
+// to avoid redundant API server GETs for pods sharing the same ReplicaSet.
+func groupPodsByOwner(ctx context.Context, c client.Client, pods []corev1.Pod) map[WorkloadKey][]corev1.Pod {
 	logger := logf.FromContext(ctx)
 	groups := make(map[WorkloadKey][]corev1.Pod)
+	// Cache ReplicaSet→Deployment resolution to avoid N+1 GETs for pods
+	// that share the same ReplicaSet (e.g. all replicas of one Deployment).
+	rsCache := make(map[types.NamespacedName]WorkloadKey)
 
 	for i := range pods {
 		pod := &pods[i]
-		key, err := resolveWorkloadKey(ctx, c, pod)
+		key, err := resolveWorkloadKey(ctx, c, pod, rsCache)
 		if err != nil {
 			// Unresolvable owner — treat as bare pod.
 			logger.V(1).Info("Could not resolve owner, treating as bare pod",
@@ -70,12 +84,13 @@ func groupPodsByOwner(ctx context.Context, c client.Client, pods []corev1.Pod) (
 		groups[key] = append(groups[key], pods[i])
 	}
 
-	return groups, nil
+	return groups
 }
 
 // resolveWorkloadKey walks the pod's ownerReferences to determine the
-// top-level workload key.
-func resolveWorkloadKey(ctx context.Context, c client.Client, pod *corev1.Pod) (WorkloadKey, error) {
+// top-level workload key. rsCache is used to avoid duplicate API calls for
+// pods that share the same ReplicaSet.
+func resolveWorkloadKey(ctx context.Context, c client.Client, pod *corev1.Pod, rsCache map[types.NamespacedName]WorkloadKey) (WorkloadKey, error) {
 	for _, ref := range pod.OwnerReferences {
 		if ref.Controller == nil || !*ref.Controller {
 			continue
@@ -83,35 +98,39 @@ func resolveWorkloadKey(ctx context.Context, c client.Client, pod *corev1.Pod) (
 
 		switch ref.Kind {
 		case "ReplicaSet":
+			// Check cache first to avoid redundant GETs.
+			rsKey := types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}
+			if cached, ok := rsCache[rsKey]; ok {
+				return cached, nil
+			}
 			// Walk one level: ReplicaSet → Deployment.
 			rs := &appsv1.ReplicaSet{}
-			if err := c.Get(ctx, types.NamespacedName{
-				Namespace: pod.Namespace,
-				Name:      ref.Name,
-			}, rs); err != nil {
+			if err := c.Get(ctx, rsKey, rs); err != nil {
 				return WorkloadKey{}, fmt.Errorf("failed to get ReplicaSet %s: %w", ref.Name, err)
 			}
 			for _, rsRef := range rs.OwnerReferences {
-				if rsRef.Controller != nil && *rsRef.Controller && rsRef.Kind == "Deployment" {
-					return WorkloadKey{
-						Kind:      "Deployment",
+				if rsRef.Controller != nil && *rsRef.Controller && rsRef.Kind == WorkloadKindDeployment {
+					wk := WorkloadKey{
+						Kind:      WorkloadKindDeployment,
 						Namespace: pod.Namespace,
 						Name:      rsRef.Name,
-					}, nil
+					}
+					rsCache[rsKey] = wk
+					return wk, nil
 				}
 			}
 			return WorkloadKey{}, fmt.Errorf("ReplicaSet %s has no Deployment owner", ref.Name)
 
-		case "StatefulSet":
+		case WorkloadKindStatefulSet:
 			return WorkloadKey{
-				Kind:      "StatefulSet",
+				Kind:      WorkloadKindStatefulSet,
 				Namespace: pod.Namespace,
 				Name:      ref.Name,
 			}, nil
 
-		case "DaemonSet":
+		case WorkloadKindDaemonSet:
 			return WorkloadKey{
-				Kind:      "DaemonSet",
+				Kind:      WorkloadKindDaemonSet,
 				Namespace: pod.Namespace,
 				Name:      ref.Name,
 			}, nil
@@ -127,7 +146,7 @@ func resolveWorkloadKey(ctx context.Context, c client.Client, pod *corev1.Pod) (
 // meaning the previous recommendation is still rolling out.
 func isRolloutInProgress(ctx context.Context, c client.Client, key WorkloadKey) (bool, error) {
 	switch key.Kind {
-	case "Deployment":
+	case WorkloadKindDeployment:
 		deploy := &appsv1.Deployment{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: key.Name}, deploy); err != nil {
 			return false, fmt.Errorf("failed to get Deployment %s: %w", key.Name, err)
@@ -138,7 +157,7 @@ func isRolloutInProgress(ctx context.Context, c client.Client, key WorkloadKey) 
 		}
 		return deploy.Status.UpdatedReplicas < desired, nil
 
-	case "StatefulSet":
+	case WorkloadKindStatefulSet:
 		sts := &appsv1.StatefulSet{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: key.Name}, sts); err != nil {
 			return false, fmt.Errorf("failed to get StatefulSet %s: %w", key.Name, err)
@@ -149,7 +168,7 @@ func isRolloutInProgress(ctx context.Context, c client.Client, key WorkloadKey) 
 		}
 		return sts.Status.UpdatedReplicas < desired, nil
 
-	case "DaemonSet":
+	case WorkloadKindDaemonSet:
 		ds := &appsv1.DaemonSet{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: key.Name}, ds); err != nil {
 			return false, fmt.Errorf("failed to get DaemonSet %s: %w", key.Name, err)
