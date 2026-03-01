@@ -1,0 +1,55 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: podfather-alerts
+  namespace: podfather-system
+  labels:
+    app.kubernetes.io/name: podfather
+spec:
+  groups:
+    - name: podfather.rules
+      rules:
+        - alert: PodStarvationDetected
+          expr: increase(podfather_pod_starvation_events_total[2m]) > 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod starvation detected"
+            description: "Podfather detected starvation events for pod {{ $labels.pod }} in namespace {{ $labels.namespace }}."
+
+        - alert: HighMetricsCollectionErrors
+          expr: rate(podfather_metrics_collection_errors_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High metrics collection error rate"
+            description: "Podfather is failing to collect metrics at a rate of {{ $value }}/s."
+
+        - alert: NoPodsMonitored
+          expr: podfather_pods_monitored == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No pods monitored"
+            description: "Podfather is not monitoring any pods for the last 10 minutes."
+
+        - alert: HighRecommendationVariance
+          expr: histogram_quantile(0.95, rate(podfather_recommendation_variance_percent_bucket[5m])) > 100
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High recommendation variance"
+            description: "The 95th percentile of recommendation variance exceeds 100%."
+
+        - alert: SlowEvaluationCycle
+          expr: histogram_quantile(0.99, rate(podfather_evaluation_duration_seconds_bucket[5m])) > 30
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Slow evaluation cycle"
+            description: "The 99th percentile evaluation duration exceeds 30 seconds."

@@ -1,0 +1,383 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  creationTimestamp: null
+  name: podautoscalers.autoscaling.podfather.io
+spec:
+  group: autoscaling.podfather.io
+  names:
+    kind: PodAutoscaler
+    listKind: PodAutoscalerList
+    plural: podautoscalers
+    shortNames:
+    - pa
+    singular: podautoscaler
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.monitoredPods
+      name: Monitored
+      type: integer
+    - jsonPath: .status.totalAdjustments
+      name: Adjustments
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          PodAutoscaler is the Schema for the podautoscalers API.
+          It defines a policy for automatically adjusting pod resource requests and limits
+          based on observed usage metrics collected from the Kubernetes Metrics API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PodAutoscalerSpec defines the desired state of PodAutoscaler.
+            properties:
+              dryRun:
+                default: false
+                description: |-
+                  DryRun, when true, makes the controller calculate recommendations but never
+                  mutate pods. Useful for auditing before enabling live updates.
+                type: boolean
+              evaluationWindowMinutes:
+                default: 5
+                description: 'EvaluationWindowMinutes controls the time window for
+                  aggregating metrics. Minimum: 1.'
+                format: int32
+                minimum: 1
+                type: integer
+              metricsCollectionIntervalSeconds:
+                default: 30
+                description: |-
+                  MetricsCollectionIntervalSeconds is how often (in seconds) the controller
+                  reconciles and re-evaluates resource allocations. Minimum: 10.
+                format: int32
+                minimum: 10
+                type: integer
+              resourcePolicy:
+                description: |-
+                  ResourcePolicy provides per-container resource boundaries.
+                  If omitted, Podfather uses built-in default constraints.
+                properties:
+                  containerPolicies:
+                    description: |-
+                      ContainerPolicies is a list of per-container resource policies.
+                      Use containerName "*" to set defaults for all containers.
+                    items:
+                      description: ContainerResourcePolicy defines resource constraints
+                        for a single container.
+                      properties:
+                        containerName:
+                          description: ContainerName is the name of the container,
+                            or "*" for all containers.
+                          type: string
+                        controlledResources:
+                          description: |-
+                            ControlledResources lists which resources (cpu, memory) Podfather manages.
+                            If empty, both cpu and memory are managed.
+                          items:
+                            description: ResourceName is the name identifying various
+                              resources in a ResourceList.
+                            type: string
+                          type: array
+                        maxAllowed:
+                          additionalProperties:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: MaxAllowed specifies the maximum resources
+                            Podfather may recommend.
+                          type: object
+                        minAllowed:
+                          additionalProperties:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: MinAllowed specifies the minimum resources
+                            Podfather may recommend.
+                          type: object
+                      required:
+                      - containerName
+                      type: object
+                    type: array
+                type: object
+              selector:
+                description: |-
+                  Selector identifies the set of pods managed by this PodAutoscaler.
+                  Only pods matching this selector will be monitored and (optionally) resized.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              targetRef:
+                description: |-
+                  TargetRef is an optional reference to the workload controller (e.g. Deployment)
+                  that owns the managed pods. Used for informational purposes and future eviction safety.
+                properties:
+                  apiVersion:
+                    description: API version of the referent (e.g. "apps/v1").
+                    type: string
+                  kind:
+                    description: Kind of the referent (e.g. "Deployment", "StatefulSet").
+                    type: string
+                  name:
+                    description: Name of the referent.
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+              updatePolicy:
+                description: UpdatePolicy controls how and whether resource changes
+                  are applied to pods.
+                properties:
+                  maxUnavailable:
+                    default: 1
+                    description: |-
+                      MaxUnavailable is the maximum number of pods that can be unavailable during
+                      eviction-based updates. Only relevant for Recreate and Auto (fallback) modes.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  updateMode:
+                    default: Auto
+                    description: 'UpdateMode selects the update strategy. One of:
+                      Auto (default), InPlace, Recreate, Off.'
+                    enum:
+                    - Auto
+                    - InPlace
+                    - Recreate
+                    - "Off"
+                    type: string
+                type: object
+              varianceThresholdPercent:
+                default: 15
+                description: |-
+                  VarianceThresholdPercent is the minimum percentage difference between current
+                  allocation and recommended allocation required to trigger an update.
+                  This prevents excessive churn caused by small oscillations.
+                format: int32
+                maximum: 100
+                minimum: 1
+                type: integer
+            required:
+            - selector
+            type: object
+          status:
+            description: PodAutoscalerStatus defines the observed state of PodAutoscaler.
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the PodAutoscaler's state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastEvaluationTime:
+                description: LastEvaluationTime is the timestamp of the most recent
+                  metrics evaluation.
+                format: date-time
+                type: string
+              lastUpdateTime:
+                description: LastUpdateTime is the timestamp of the most recent pod
+                  resource update.
+                format: date-time
+                type: string
+              monitoredPods:
+                description: MonitoredPods is the current number of running pods being
+                  monitored.
+                format: int32
+                type: integer
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the high-level lifecycle phase of the PodAutoscaler.
+                type: string
+              recommendation:
+                description: Recommendation holds the most recently computed resource
+                  recommendation.
+                properties:
+                  containerRecommendations:
+                    description: ContainerRecommendations is a list of resource recommendations,
+                      one per container.
+                    items:
+                      description: ContainerRecommendation is the recommended resources
+                        for a single container.
+                      properties:
+                        containerName:
+                          description: ContainerName is the name of the container.
+                          type: string
+                        lowerBound:
+                          additionalProperties:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: LowerBound is the lower bound of the recommendation
+                            range.
+                          type: object
+                        target:
+                          additionalProperties:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: Target is the recommended resource requests.
+                          type: object
+                        upperBound:
+                          additionalProperties:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          description: UpperBound is the upper bound of the recommendation
+                            range (recommended limits).
+                          type: object
+                      required:
+                      - containerName
+                      - target
+                      type: object
+                    type: array
+                type: object
+              totalAdjustments:
+                description: TotalAdjustments is the cumulative number of resource
+                  adjustments applied.
+                format: int64
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+status:
+  acceptedNames:
+    kind: ""
+    plural: ""
+  conditions: null
+  storedVersions: null
