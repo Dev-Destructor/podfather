@@ -1,0 +1,324 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  annotations:
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "autoscaling.podfather.io/v1alpha1",
+          "kind": "PodAutoscaler",
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "kustomize",
+              "app.kubernetes.io/name": "podfather"
+            },
+            "name": "podautoscaler-sample"
+          },
+          "spec": {
+            "dryRun": false,
+            "evaluationWindowMinutes": 5,
+            "metricsCollectionIntervalSeconds": 30,
+            "resourcePolicy": {
+              "containerPolicies": [
+                {
+                  "containerName": "*",
+                  "controlledResources": [
+                    "cpu",
+                    "memory"
+                  ],
+                  "maxAllowed": {
+                    "cpu": "4",
+                    "memory": "8Gi"
+                  },
+                  "minAllowed": {
+                    "cpu": "50m",
+                    "memory": "64Mi"
+                  }
+                }
+              ]
+            },
+            "selector": {
+              "matchLabels": {
+                "app": "my-app"
+              }
+            },
+            "targetRef": {
+              "apiVersion": "apps/v1",
+              "kind": "Deployment",
+              "name": "my-app"
+            },
+            "updatePolicy": {
+              "maxUnavailable": 1,
+              "updateMode": "Auto"
+            },
+            "varianceThresholdPercent": 15
+          }
+        }
+      ]
+    capabilities: Auto Pilot
+    categories: Application Runtime
+    containerImage: controller:latest
+    createdAt: "2026-02-28T18:20:28Z"
+    description: Podfather is a Kubernetes operator that optimises pod resource allocation
+      dynamically by watching pods, collecting resource-usage metrics, and seamlessly
+      adjusting requests and limits based on actual needs.
+    operatorframework.io/suggested-namespace: podfather-system
+    operators.operatorframework.io/builder: operator-sdk-v1.42.0
+    operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
+    repository: https://github.com/des57/podfather
+    support: Podfather Contributors
+  name: podfather.v0.0.1
+  namespace: placeholder
+spec:
+  apiservicedefinitions: {}
+  customresourcedefinitions:
+    owned:
+    - description: |-
+        PodAutoscaler is the Schema for the podautoscalers API.
+        It defines a policy for automatically adjusting pod resource requests and limits
+        based on observed usage metrics collected from the Kubernetes Metrics API.
+      displayName: Pod Autoscaler
+      kind: PodAutoscaler
+      name: podautoscalers.autoscaling.podfather.io
+      version: v1alpha1
+  description: |
+    ## Podfather — Autonomous Pod Resource Optimizer
+
+    Podfather is a **Level 5 (Auto Pilot)** Kubernetes Operator that brings
+    intelligent, metrics-driven vertical scaling to your workloads.
+
+    ### Features
+    | Capability | Description |
+    |---|---|
+    | **Metric-Driven Scaling** | Collects real-time CPU & memory usage from the Kubernetes Metrics API |
+    | **In-Place Resize** | Leverages KEP-1287 in-place pod vertical scaling when supported |
+    | **Safe Eviction Fallback** | Gracefully evicts and lets the workload controller recreate pods |
+    | **Dry-Run Mode** | Audits recommendations without mutating any pods |
+    | **Deep Observability** | Exposes Prometheus metrics, alerting rules, and a Grafana dashboard |
+    | **Auto-Healing** | Detects anomalous spikes and heals starved pods autonomously |
+
+    ### How It Works
+    1. A `PodAutoscaler` CR selects a set of pods via label selector.
+    2. The controller periodically collects resource-usage metrics.
+    3. A pluggable calculator computes ideal requests/limits considering
+       average use, peak use, min/max constraints, and a configurable
+       variance threshold.
+    4. If the variance exceeds the threshold, pods are updated via the
+       chosen strategy (Auto → InPlace → Recreate → Off).
+
+    ### Getting Started
+    ```yaml
+    apiVersion: autoscaling.podfather.io/v1alpha1
+    kind: PodAutoscaler
+    metadata:
+      name: my-app
+    spec:
+      selector:
+        matchLabels:
+          app: my-app
+      updatePolicy:
+        updateMode: Auto
+      varianceThresholdPercent: 15
+    ```
+
+    ### Prerequisites
+    - Kubernetes 1.28+ (1.31+ for in-place resize)
+    - Metrics Server installed
+    - OLM (for bundle installation) or Helm/Kustomize
+  displayName: Podfather
+  icon:
+  - base64data: ""
+    mediatype: image/png
+  install:
+    spec:
+      clusterPermissions:
+      - rules:
+        - apiGroups:
+          - ""
+          resources:
+          - events
+          verbs:
+          - create
+          - patch
+        - apiGroups:
+          - ""
+          resources:
+          - pods
+          verbs:
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - autoscaling.podfather.io
+          resources:
+          - podautoscalers
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - autoscaling.podfather.io
+          resources:
+          - podautoscalers/finalizers
+          verbs:
+          - update
+        - apiGroups:
+          - autoscaling.podfather.io
+          resources:
+          - podautoscalers/status
+          verbs:
+          - get
+          - patch
+          - update
+        - apiGroups:
+          - metrics.k8s.io
+          resources:
+          - pods
+          verbs:
+          - get
+          - list
+        - apiGroups:
+          - authentication.k8s.io
+          resources:
+          - tokenreviews
+          verbs:
+          - create
+        - apiGroups:
+          - authorization.k8s.io
+          resources:
+          - subjectaccessreviews
+          verbs:
+          - create
+        serviceAccountName: podfather-controller-manager
+      deployments:
+      - label:
+          app.kubernetes.io/managed-by: kustomize
+          app.kubernetes.io/name: podfather
+          control-plane: controller-manager
+        name: podfather-controller-manager
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: podfather
+              control-plane: controller-manager
+          strategy: {}
+          template:
+            metadata:
+              annotations:
+                kubectl.kubernetes.io/default-container: manager
+              labels:
+                app.kubernetes.io/name: podfather
+                control-plane: controller-manager
+            spec:
+              containers:
+              - args:
+                - --metrics-bind-address=:8443
+                - --leader-elect
+                - --health-probe-bind-address=:8081
+                command:
+                - /manager
+                image: controller:latest
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8081
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                name: manager
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: 8081
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 128Mi
+                  requests:
+                    cpu: 10m
+                    memory: 64Mi
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                    - ALL
+              securityContext:
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+              serviceAccountName: podfather-controller-manager
+              terminationGracePeriodSeconds: 10
+      permissions:
+      - rules:
+        - apiGroups:
+          - ""
+          resources:
+          - configmaps
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - coordination.k8s.io
+          resources:
+          - leases
+          verbs:
+          - get
+          - list
+          - watch
+          - create
+          - update
+          - patch
+          - delete
+        - apiGroups:
+          - ""
+          resources:
+          - events
+          verbs:
+          - create
+          - patch
+        serviceAccountName: podfather-controller-manager
+    strategy: deployment
+  installModes:
+  - supported: true
+    type: OwnNamespace
+  - supported: true
+    type: SingleNamespace
+  - supported: false
+    type: MultiNamespace
+  - supported: true
+    type: AllNamespaces
+  keywords:
+  - kubernetes
+  - autoscaling
+  - vertical-pod-autoscaler
+  - resource-optimization
+  - operator
+  - podfather
+  links:
+  - name: GitHub Repository
+    url: https://github.com/des57/podfather
+  - name: Documentation
+    url: https://github.com/des57/podfather/blob/main/README.md
+  maintainers:
+  - email: podfather-maintainers@podfather.io
+    name: Podfather Contributors
+  maturity: alpha
+  minKubeVersion: 1.28.0
+  provider:
+    name: Podfather
+    url: https://podfather.io
+  version: 0.0.1
