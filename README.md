@@ -25,6 +25,8 @@ Built with [Operator SDK](https://sdk.operatorframework.io/) and [controller-run
   - [Spec Reference](#spec-reference)
   - [Status Reference](#status-reference)
   - [Update Modes](#update-modes)
+  - [Multi-Replica Remediation](#multi-replica-remediation)
+  - [VPA Integration](#vpa-integration)
   - [Command-Line Flags](#command-line-flags)
 - [Observability](#observability)
   - [Prometheus Metrics](#prometheus-metrics)
@@ -58,6 +60,11 @@ Built with [Operator SDK](https://sdk.operatorframework.io/) and [controller-run
 | Watch pods via label selector and collect metrics | Done |
 | Calculate ideal CPU/memory requests and limits | Done |
 | In-place vertical pod scaling (KEP-1287) | Done |
+| Workload-grouped evaluation (prevents multi-replica oscillation) | Done |
+| Multi-replica remediation strategies (MaxPod / MinPod / Auto P90) | Done |
+| StatefulSet per-pod in-place resize (no rolling restart) | Done |
+| Rollout-in-progress guard (skip apply during active rollout) | Done |
+| Workload template patching for Deployment / StatefulSet / DaemonSet | Done |
 | Fallback eviction/recreation with PDB awareness | Done |
 | Dry-run mode (recommend without applying) | Done |
 | Configurable variance threshold to prevent churn | Done |
@@ -95,9 +102,12 @@ podfather/
 ├── internal/
 │   ├── calculator/                    # Pure business logic (no K8s deps)
 │   │   ├── calculator.go             # Calculate() function and types
-│   │   └── calculator_test.go        # Table-driven unit tests (10 cases)
+│   │   ├── calculator_test.go        # Table-driven unit tests (10 cases)
+│   │   ├── aggregate.go              # Multi-replica metric aggregation (Max/Min/P90)
+│   │   └── aggregate_test.go         # 13 table-driven tests for aggregation
 │   ├── controller/                   # Reconciliation loop (operator-sdk scaffold + full implementation)
 │   │   ├── podautoscaler_controller.go
+│   │   ├── grouping.go               # Pod-to-workload grouping + rollout-in-progress detection
 │   │   ├── podautoscaler_controller_test.go  # Controller test scaffold
 │   │   └── suite_test.go                     # EnvTest suite (operator-sdk scaffold)
 │   ├── metrics/                       # Prometheus metrics + Metrics API collector
@@ -145,24 +155,33 @@ Every reconciliation cycle follows this exact sequence:
 │ 3. Discover Pods        │  <- List pods matching label selector
 └──────────┬──────────────┘
            v
+┌─────────────────────────────────────────┐
+│ 4. Group pods by owning workload        │  <- Pod→ReplicaSet→Deployment, Pod→STS, Pod→DS
+│    (VPA path: per-pod, unchanged)       │
+└──────────┬──────────────────────────────┘
+           v
+┌─────────────────────────────────────────┐
+│ 5. For each workload group:             │
+│   a. Rollout-in-progress check          │  <- Skip apply if rollout active
+│   b. Collect metrics per pod            │  <- Query Kubernetes Metrics API
+│   c. Aggregate metrics (Max/Min/P90)    │  <- AggregateUsage() per container
+│   d. Calculate ideal resources          │  <- calculator.Calculate()
+│   e. Check variance threshold           │  <- Is deviation > threshold?
+└──────────┬──────────────────────────────┘
+           v
+┌─────────────────────────────────────────┐
+│ 6. Apply update (once per workload)     │
+│   StatefulSet → per-pod in-place        │  <- No rolling restart
+│   Deployment/DaemonSet → template patch │  <- Rolling update handles replacement
+│   Bare pod → in-place or template       │
+└──────────┬──────────────────────────────┘
+           v
 ┌─────────────────────────┐
-│ 4. For each pod:        │
-│   a. Collect Metrics    │  <- Query Kubernetes Metrics API
-│   b. Get Current Alloc  │  <- Read pod.spec.containers[].resources
-│   c. Calculate Ideal    │  <- calculator.Calculate()
-│   d. Check Variance     │  <- Is deviation > threshold?
+│ 7. Update CR Status     │  <- Phase, conditions, workloadGroups, counters
 └──────────┬──────────────┘
            v
 ┌─────────────────────────┐
-│ 5. Apply Update         │  <- In-place patch or eviction (if not dry-run)
-└──────────┬──────────────┘
-           v
-┌─────────────────────────┐
-│ 6. Update CR Status     │  <- Phase, conditions, recommendations, counters
-└──────────┬──────────────┘
-           v
-┌─────────────────────────┐
-│ 7. Requeue              │  <- After metricsCollectionIntervalSeconds
+│ 8. Requeue              │  <- After metricsCollectionIntervalSeconds
 └─────────────────────────┘
 ```
 
@@ -333,6 +352,8 @@ spec:
 | `evaluationWindowMinutes` | `int32` | `5` | Time window for metrics aggregation |
 | `varianceThresholdPercent` | `int32` | `15` | Minimum % deviation to trigger an update |
 | `dryRun` | `bool` | `false` | If true, calculate but never apply changes |
+| `remediationStrategy` | `string` | `Auto` | How to aggregate metrics across replicas: `MaxPod`, `MinPod`, `Auto` (P90) |
+| `statefulSetPolicy.updateMode` | `string` | `PerPodInPlace` | How to apply updates to StatefulSet pods: `PerPodInPlace`, `Template` |
 
 ### Status Reference
 
@@ -342,6 +363,7 @@ spec:
 | `conditions` | `[]Condition` | Kubernetes-standard conditions (`Ready`, `MetricsAvailable`) |
 | `monitoredPods` | `int32` | Number of running pods currently being watched |
 | `recommendation` | `Recommendation` | Latest computed resource recommendations per container |
+| `workloadGroups` | `[]WorkloadGroupStatus` | Per-workload aggregation results (kind, name, replicas, strategy, containerRecommendations) |
 | `lastEvaluationTime` | `Time` | When metrics were last evaluated |
 | `lastUpdateTime` | `Time` | When resources were last updated on pods |
 | `totalAdjustments` | `int64` | Cumulative number of resource adjustments |
@@ -351,10 +373,87 @@ spec:
 
 | Mode | Behavior |
 |---|---|
-| **Auto** | Try in-place vertical scaling first (Kubernetes 1.27+, KEP-1287). If unsupported or the patch fails, fall back to eviction. **Recommended for most users.** |
+| **Auto** | Try in-place vertical scaling first (Kubernetes 1.27+, KEP-1287). If unsupported or the patch fails, fall back to patching the owning workload's PodTemplate (the workload controller's rolling update then replaces pods with corrected resources). **Recommended for most users.** |
 | **InPlace** | Only attempt in-place scaling. Fail with an error if the cluster doesn't support it. |
-| **Recreate** | Always evict the pod and let the owning controller recreate it. Safest option for older clusters. |
+| **Recreate** | Patch the owning workload's PodTemplate first, then evict the pod for immediate replacement. Ensures the new pod always gets the correct resources. |
 | **Off** | Never mutate pods. The controller still collects metrics and writes recommendations to status. |
+
+---
+
+### Multi-Replica Remediation
+
+The default single-pod evaluation model is **catastrophic for multi-replica workloads**. Consider a Deployment with 5 replicas: 4 pods consuming 80% of their allocations and 1 pod consuming only 20%. The low-consuming pod triggers a template patch that cuts resources for all 5 replicas — the 4 busy siblings immediately get throttled or OOMKilled, which triggers another upward patch in the next cycle, creating an oscillation loop.
+
+Podfather solves this by **grouping all pods of a workload together** and computing a **single aggregated recommendation** from the combined metrics before applying any changes.
+
+#### Remediation Strategies
+
+| Strategy | Aggregation | When to use |
+|---|---|---|
+| `MaxPod` | Max of each metric across all replicas | Latency-sensitive workloads; never under-provision the busiest replica |
+| `MinPod` | Min of each metric across all replicas | Cost optimisation; accept that slightly busier replicas may be constrained |
+| `Auto` *(default)* | **P90 (90th percentile)** of each metric | Most workloads; outlier spikes don't inflate the recommendation for all replicas |
+
+The P90 calculation uses the nearest-rank method: given $n$ replicas, the value at sorted index $\lceil 0.9 \times n \rceil - 1$ is selected. For 2 replicas this degrades to max; for 10 replicas the single highest-load outlier is excluded.
+
+```yaml
+spec:
+  remediationStrategy: Auto   # MaxPod | MinPod | Auto (default)
+```
+
+#### Rollout-In-Progress Guard
+
+Before applying any update, Podfather checks whether the target workload already has a rollout in progress (`UpdatedReplicas < DesiredReplicas`). If so, the update is **skipped for that reconcile cycle** and a `RolloutInProgress` Kubernetes Event is emitted. The recommendation is still computed and written to `status.workloadGroups` for observability.
+
+This prevents Podfather from queuing a second template patch on top of an already-running rollout, which would restart the rolling update from scratch.
+
+#### StatefulSet Policy
+
+StatefulSets have named, identity-aware pods (stable network identity and storage). A rolling restart may cause unacceptable downtime or ordering constraints. Podfather handles StatefulSets differently:
+
+| `statefulSetPolicy.updateMode` | Behaviour |
+|---|---|
+| `PerPodInPlace` *(default)* | Applies the aggregated recommendation to **each pod individually** via in-place resize (KEP-1287). The StatefulSet template is never touched — no rolling restart, no pod recreation. |
+| `Template` | Patches the StatefulSet PodTemplate, triggering the StatefulSet controller's ordered rolling update. |
+
+```yaml
+spec:
+  statefulSetPolicy:
+    updateMode: PerPodInPlace   # PerPodInPlace | Template (default: PerPodInPlace)
+```
+
+---
+
+### VPA Integration
+
+Podfather can optionally integrate with the [Kubernetes Vertical Pod Autoscaler (VPA)](https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler). When enabled via `spec.vpaPolicy`, Podfather:
+
+1. **Detects VPA CRDs** — checks whether VPA is installed in the cluster at reconciliation time.
+2. **Discovers matching VPAs** — finds VPA objects targeting the same workload (matched by `targetRef` kind and name).
+3. **Uses VPA recommendations** — if a matching VPA is found and is in `"Off"` mode (recommendation-only), Podfather uses VPA's container recommendations instead of its own algorithm.
+4. **Conflict detection** — if a matching VPA is found but is NOT in `"Off"` mode, Podfather detects the conflict:
+   - In **strict mode** (`vpaPolicy.strictMode: true`): refuses to act and emits a warning event.
+   - In **default mode**: logs a warning and falls back to its own algorithm.
+
+**Configuration example:**
+
+```yaml
+spec:
+  vpaPolicy:
+    enabled: true          # look for VPA resources (default: true)
+    vpaName: ""            # optional: explicit VPA name; empty = auto-discover by targetRef
+    strictMode: false      # true = refuse to act if VPA is not in "Off" mode
+```
+
+VPA integration state is reported in `.status.vpaStatus`:
+
+| Field | Description |
+|---|---|
+| `vpaInstalled` | Whether VPA CRDs are present in the cluster |
+| `matchingVPAName` | Name of the matching VPA object (empty if none) |
+| `vpaUpdateMode` | The update mode of the matched VPA |
+| `usingVPARecommendations` | True when actively using VPA recommendations |
+| `vpaConflict` | Describes any detected conflict with VPA |
 
 ### Command-Line Flags
 
@@ -466,37 +565,6 @@ If current allocation is zero, variance is treated as 100%. Default threshold is
 | MinMemoryBytes | 16 MiB | Minimum viable memory |
 | MaxMemoryBytes | 64 GiB | Upper bound |
 
-### VPA Integration
-
-Podfather can optionally integrate with the [Kubernetes Vertical Pod Autoscaler (VPA)](https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler). When enabled via `spec.vpaPolicy`, Podfather:
-
-1. **Detects VPA CRDs** — checks whether VPA is installed in the cluster at reconciliation time.
-2. **Discovers matching VPAs** — finds VPA objects targeting the same workload (matched by `targetRef` kind and name).
-3. **Uses VPA recommendations** — if a matching VPA is found and is in `"Off"` mode (recommendation-only), Podfather uses VPA's container recommendations instead of its own algorithm.
-4. **Conflict detection** — if a matching VPA is found but is NOT in `"Off"` mode, Podfather detects the conflict:
-   - In **strict mode** (`vpaPolicy.strictMode: true`): refuses to act and emits a warning event.
-   - In **default mode**: logs a warning and falls back to its own algorithm.
-
-**Configuration example:**
-
-```yaml
-spec:
-  vpaPolicy:
-    enabled: true          # look for VPA resources (default: true)
-    vpaName: ""            # optional: explicit VPA name; empty = auto-discover by targetRef
-    strictMode: false      # true = refuse to act if VPA is not in "Off" mode
-```
-
-VPA integration state is reported in `.status.vpaStatus`:
-
-| Field | Description |
-|---|---|
-| `vpaInstalled` | Whether VPA CRDs are present in the cluster |
-| `matchingVPAName` | Name of the matching VPA object (empty if none) |
-| `vpaUpdateMode` | The update mode of the matched VPA |
-| `usingVPARecommendations` | True when actively using VPA recommendations |
-| `vpaConflict` | Describes any detected conflict with VPA |
-
 ### Namespace-Aware Resource Clamping (LimitRange & ResourceQuota)
 
 Podfather automatically detects and respects **LimitRange** and **ResourceQuota** objects in the namespace where managed pods run. This prevents the operator from recommending resource values that the Kubernetes API server would reject.
@@ -546,11 +614,11 @@ operator-sdk version  # 1.42+ (used to scaffold the project)
 | `api/v1alpha1/` | CRD Go types | Yes |
 | `internal/calculator/` | Resource calculation logic | **No** (pure Go) |
 | `internal/metrics/` | Prometheus + Metrics API client | Yes |
-| `internal/updater/` | Pod mutation strategies | Yes |
+| `internal/updater/` | Pod mutation strategies (in-place, workload template patch, eviction) | Yes |
 | `internal/telemetry/` | OpenTelemetry setup | No (OTEL SDK only) |
 | `internal/vpa/` | VPA detection & recommendation parsing | Yes |
 | `internal/namespacelimits/` | LimitRange & ResourceQuota clamping | Yes |
-| `internal/controller/` | Reconciliation loop | Yes |
+| `internal/controller/` | Reconciliation loop + grouping + rollout detection | Yes |
 | `cmd/` | Entry point | Yes |
 | `config/` | Kustomize manifests | N/A (YAML) |
 | `test/` | E2E tests | Yes |
@@ -648,11 +716,16 @@ The operator requires these cluster-level permissions (generated by controller-g
 | `autoscaling.podfather.io` | `podautoscalers/status` | get, update, patch | Update CR status |
 | `autoscaling.podfather.io` | `podautoscalers/finalizers` | update | Manage finalizers |
 | `""` (core) | `pods` | get, list, watch, update, patch, delete | Monitor and update pods |
+| `""` (core) | `pods/eviction` | create | Evict pods via the Eviction API (PDB-aware) |
 | `""` (core) | `events` | create, patch | Emit Kubernetes Events |
 | `""` (core) | `limitranges` | get, list, watch | Read namespace LimitRange constraints |
 | `""` (core) | `resourcequotas` | get, list, watch | Read namespace ResourceQuota constraints |
 | `metrics.k8s.io` | `pods` | get, list | Read pod resource metrics |
 | `autoscaling.k8s.io` | `verticalpodautoscalers` | get, list, watch | VPA integration |
+| `apps` | `deployments` | get, list, watch, update, patch | Rollout status check; patch PodTemplate |
+| `apps` | `replicasets` | get, list, watch | Walk Pod → ReplicaSet → Deployment owner chain |
+| `apps` | `statefulsets` | get, list, watch, update, patch | Rollout status check; patch template or per-pod in-place |
+| `apps` | `daemonsets` | get, list, watch, update, patch | Rollout status check; patch PodTemplate |
 | `coordination.k8s.io` | `leases` | get, list, watch, create, update, patch, delete | Leader election |
 
 Additional RBAC for metrics authentication is in `config/rbac/metrics_auth_role.yaml`.
