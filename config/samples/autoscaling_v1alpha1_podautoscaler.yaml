@@ -32,6 +32,16 @@ spec:
   evaluationWindowMinutes: 5
   varianceThresholdPercent: 15
   dryRun: false
+  # Remediation strategy for multi-replica workloads:
+  #   MaxPod  - uses the busiest replica's metrics (conservative)
+  #   MinPod  - uses the quietest replica's metrics (aggressive)
+  #   Auto    - uses P90 across all replicas (balanced, default)
+  remediationStrategy: Auto
+  # StatefulSet-specific update policy:
+  #   PerPodInPlace - in-place resize each pod individually (no rolling restart, default)
+  #   Template      - patch the STS PodTemplate (triggers rolling update)
+  # statefulSetPolicy:
+  #   updateMode: PerPodInPlace
   # VPA integration: when enabled, Podfather uses VPA recommendations
   # instead of its own algorithm (requires VPA to be in "Off" mode).
   # vpaPolicy:

@@ -78,6 +78,17 @@ spec:
                 format: int32
                 minimum: 10
                 type: integer
+              remediationStrategy:
+                default: Auto
+                description: |-
+                  RemediationStrategy controls how metrics from multiple replicas within
+                  a workload are aggregated before computing a single recommendation.
+                  MaxPod uses the busiest replica, MinPod the quietest, and Auto uses P90.
+                enum:
+                - MaxPod
+                - MinPod
+                - Auto
+                type: string
               resourcePolicy:
                 description: |-
                   ResourcePolicy provides per-container resource boundaries.
@@ -177,6 +188,24 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
+              statefulSetPolicy:
+                description: |-
+                  StatefulSetPolicy configures how resource changes are applied to
+                  StatefulSet pods. By default, Podfather applies the aggregated
+                  recommendation via in-place resize to each pod individually, avoiding
+                  a rolling restart.
+                properties:
+                  updateMode:
+                    default: PerPodInPlace
+                    description: |-
+                      UpdateMode controls how resource changes are applied to StatefulSet pods.
+                      PerPodInPlace (default) resizes each pod in-place without touching the STS
+                      template. Template patches the PodTemplate, triggering a rolling update.
+                    enum:
+                    - PerPodInPlace
+                    - Template
+                    type: string
+                type: object
               targetRef:
                 description: |-
                   TargetRef is an optional reference to the workload controller (e.g. Deployment)
@@ -460,6 +489,82 @@ spec:
                       VPA.
                     type: string
                 type: object
+              workloadGroups:
+                description: |-
+                  WorkloadGroups reports per-workload aggregation results. Each entry
+                  describes one workload (Deployment, StatefulSet, etc.) and the
+                  aggregate recommendation computed for it.
+                items:
+                  description: WorkloadGroupStatus reports aggregation results for
+                    a single workload group.
+                  properties:
+                    containerRecommendations:
+                      description: ContainerRecommendations lists the aggregated recommendation
+                        per container.
+                      items:
+                        description: ContainerRecommendation is the recommended resources
+                          for a single container.
+                        properties:
+                          containerName:
+                            description: ContainerName is the name of the container.
+                            type: string
+                          lowerBound:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: LowerBound is the lower bound of the recommendation
+                              range.
+                            type: object
+                          target:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Target is the recommended resource requests.
+                            type: object
+                          upperBound:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: UpperBound is the upper bound of the recommendation
+                              range (recommended limits).
+                            type: object
+                        required:
+                        - containerName
+                        - target
+                        type: object
+                      type: array
+                    kind:
+                      description: Kind is the workload kind (e.g. "Deployment", "StatefulSet",
+                        "BarePod").
+                      type: string
+                    name:
+                      description: Name is the workload name.
+                      type: string
+                    replicas:
+                      description: Replicas is the number of running pods in this
+                        group.
+                      format: int32
+                      type: integer
+                    strategy:
+                      description: Strategy is the remediation strategy used for this
+                        group.
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  - replicas
+                  - strategy
+                  type: object
+                type: array
             type: object
         type: object
     served: true

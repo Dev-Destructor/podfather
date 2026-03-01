@@ -57,6 +57,39 @@ const (
 	UpdateModeOff UpdateMode = "Off"
 )
 
+// RemediationStrategy controls how metrics from multiple replicas within
+// a workload (Deployment, StatefulSet, DaemonSet) are aggregated before
+// computing a single resource recommendation for the workload.
+type RemediationStrategy string
+
+const (
+	// RemediationMaxPod bases the recommendation on the replica consuming the
+	// most resources. Conservative: prevents starvation of the busiest pod.
+	RemediationMaxPod RemediationStrategy = "MaxPod"
+	// RemediationMinPod bases the recommendation on the replica consuming the
+	// fewest resources. Aggressive: saves the most resources, but risks
+	// throttling or OOMKill on busier replicas.
+	RemediationMinPod RemediationStrategy = "MinPod"
+	// RemediationAuto aggregates metrics across all replicas using P90
+	// (90th percentile) for each metric field. Balanced: covers most workloads
+	// without extreme over/under-provisioning.
+	RemediationAuto RemediationStrategy = "Auto"
+)
+
+// StatefulSetUpdateMode controls how resource changes are applied to
+// StatefulSet pods.
+type StatefulSetUpdateMode string
+
+const (
+	// StatefulSetPerPodInPlace applies the unified recommendation to each
+	// StatefulSet pod individually via in-place resize. The StatefulSet
+	// template is never touched, so no rolling restart occurs.
+	StatefulSetPerPodInPlace StatefulSetUpdateMode = "PerPodInPlace"
+	// StatefulSetTemplate patches the StatefulSet PodTemplate, triggering
+	// the StatefulSet controller's standard rolling update.
+	StatefulSetTemplate StatefulSetUpdateMode = "Template"
+)
+
 // ---- Spec Types ----
 
 // PodAutoscalerSpec defines the desired state of PodAutoscaler.
@@ -113,6 +146,21 @@ type PodAutoscalerSpec struct {
 	// same workload and uses VPA recommendations instead of its own algorithm.
 	// +optional
 	VPAPolicy *VPAPolicy `json:"vpaPolicy,omitempty"`
+
+	// RemediationStrategy controls how metrics from multiple replicas within
+	// a workload are aggregated before computing a single recommendation.
+	// MaxPod uses the busiest replica, MinPod the quietest, and Auto uses P90.
+	// +kubebuilder:validation:Enum=MaxPod;MinPod;Auto
+	// +kubebuilder:default=Auto
+	// +optional
+	RemediationStrategy *RemediationStrategy `json:"remediationStrategy,omitempty"`
+
+	// StatefulSetPolicy configures how resource changes are applied to
+	// StatefulSet pods. By default, Podfather applies the aggregated
+	// recommendation via in-place resize to each pod individually, avoiding
+	// a rolling restart.
+	// +optional
+	StatefulSetPolicy *StatefulSetPolicy `json:"statefulSetPolicy,omitempty"`
 }
 
 // CrossVersionObjectReference identifies a workload controller across API versions.
@@ -192,6 +240,17 @@ type UpdatePolicy struct {
 	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
 }
 
+// StatefulSetPolicy configures StatefulSet-specific update behaviour.
+type StatefulSetPolicy struct {
+	// UpdateMode controls how resource changes are applied to StatefulSet pods.
+	// PerPodInPlace (default) resizes each pod in-place without touching the STS
+	// template. Template patches the PodTemplate, triggering a rolling update.
+	// +kubebuilder:validation:Enum=PerPodInPlace;Template
+	// +kubebuilder:default=PerPodInPlace
+	// +optional
+	UpdateMode StatefulSetUpdateMode `json:"updateMode,omitempty"`
+}
+
 // ---- Status Types ----
 
 // PodAutoscalerStatus defines the observed state of PodAutoscaler.
@@ -236,6 +295,12 @@ type PodAutoscalerStatus struct {
 	// boundaries that Podfather respects when making recommendations.
 	// +optional
 	NamespaceConstraints *NamespaceConstraintsStatus `json:"namespaceConstraints,omitempty"`
+
+	// WorkloadGroups reports per-workload aggregation results. Each entry
+	// describes one workload (Deployment, StatefulSet, etc.) and the
+	// aggregate recommendation computed for it.
+	// +optional
+	WorkloadGroups []WorkloadGroupStatus `json:"workloadGroups,omitempty"`
 }
 
 // VPAIntegrationStatus reports the current state of VPA integration.
@@ -295,6 +360,25 @@ type NamespaceConstraintsStatus struct {
 	// adjustments made due to namespace constraints in the last evaluation.
 	// +optional
 	ClampReasons []string `json:"clampReasons,omitempty"`
+}
+
+// WorkloadGroupStatus reports aggregation results for a single workload group.
+type WorkloadGroupStatus struct {
+	// Kind is the workload kind (e.g. "Deployment", "StatefulSet", "BarePod").
+	Kind string `json:"kind"`
+
+	// Name is the workload name.
+	Name string `json:"name"`
+
+	// Replicas is the number of running pods in this group.
+	Replicas int32 `json:"replicas"`
+
+	// Strategy is the remediation strategy used for this group.
+	Strategy RemediationStrategy `json:"strategy"`
+
+	// ContainerRecommendations lists the aggregated recommendation per container.
+	// +optional
+	ContainerRecommendations []ContainerRecommendation `json:"containerRecommendations,omitempty"`
 }
 
 // Recommendation holds per-container resource recommendation data.
