@@ -692,7 +692,7 @@ func (r *PodAutoscalerReconciler) evaluateWorkloadGroup(
 	sort.Strings(sortedContainerNames)
 
 	// Step 3: For each container, aggregate metrics and compute recommendation.
-	var containerRecs []autoscalingv1alpha1.ContainerRecommendation
+	containerRecs := make([]autoscalingv1alpha1.ContainerRecommendation, 0, len(sortedContainerNames))
 	var adjustments int64
 	var clampReasons []string
 
@@ -927,7 +927,7 @@ func (r *PodAutoscalerReconciler) collectGroupMetricsForStatus(
 	sort.Strings(sortedNames)
 
 	// Aggregate per-container across all pods and compute recommendations.
-	var containerRecs []autoscalingv1alpha1.ContainerRecommendation
+	containerRecs := make([]autoscalingv1alpha1.ContainerRecommendation, 0, len(sortedNames))
 	var clampReasons []string
 
 	for _, containerName := range sortedNames {
